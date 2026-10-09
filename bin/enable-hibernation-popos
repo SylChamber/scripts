@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+#
+# enable-hibernation-24.04.sh — automatise les étapes 2 à 7 de
+# https://system76.com/support/enable-hibernation/ pour Pop!_OS 24.04
+#
+# À exécuter DANS Pop!_OS Recovery (démarrage -> "PopOS Recovery" -> Try Demo Mode),
+# PAS depuis le système installé. Lancez avec : sudo bash enable-hibernation-24.04.sh
+
+set -euo pipefail
+
+error() { echo "ERREUR : $*" >&2; exit 1; }
+info()  { echo ">>> $*"; }
+
+[[ $EUID -eq 0 ]] || error "Lancez ce script avec sudo (root requis)."
+
+# --- Paramètres : disque et partition LUKS -------------------------------
+DISK="${1:-}"
+LUKS_PART="${2:-}"
+
+if [[ -z $DISK || -z $LUKS_PART ]]; then
+    echo "Utilisation : sudo $0 <disque> <partition-luks>"
+    echo "Exemple SATA : sudo $0 /dev/sda /dev/sda3"
+    echo "Exemple NVMe : sudo $0 /dev/nvme0n1 /dev/nvme0n1p3"
+    echo
+    echo "Partitions détectées :"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+    exit 1
+fi
+
+[[ -b $DISK ]]     || error "$DISK introuvable."
+[[ -b $LUKS_PART ]] || error "$LUKS_PART introuvable."
+
+confirm() {
+    local answer
+    read -r -p "$1 [oui/NON] : " answer
+    [[ $answer == "oui" || $answer == "o" ]] || error "Annulé par l'utilisateur."
+}
+
+# ======================================================================
+# Étape 0 : rappel préalable — désactivation du zram AVANT le recovery
+# ======================================================================
+cat <<'AVERTISSEMENT'
+
+========================================================================
+  AVANT DE CONTINUER :
+  Sur Pop!_OS 24.04, le swap zram est activé par défaut. Il DOIT être
+  désactivé depuis le système installé (PAS depuis le Recovery) avant
+  de redémarrer en mode Recovery :
+
+      sudo systemctl disable --now pop-default-settings-zram.service
+
+  Puis redémarrez et démarrez en mode Recovery (touche ESPACE au boot,
+  "PopOS Recovery", puis "Try Demo Mode").
+
+  Si ce n'est pas encore fait, quittez ce script (ctrl+c), exécutez la
+  commande ci-dessus sur le système installé, et revenez ici.
+========================================================================
+
+AVERTISSEMENT
+confirm "Le service zram a-t-il été désactivé sur le système installé avant ce démarrage en Recovery ?"
+
+# ======================================================================
+# Vérification de la présence du swap zram
+# ======================================================================
+info "Vérification de la présence du swap zram..."
+
+ZRAM_DETECTED=0
+if ls /dev/zram* >/dev/null 2>&1; then ZRAM_DETECTED=1; fi
+if swapon --show 2>/dev/null | grep -q zram; then ZRAM_DETECTED=1; fi
+
+if [[ $ZRAM_DETECTED -eq 1 ]]; then
+    echo "Swap zram détecté :"
+    swapon --show || true
+    ls -l /dev/zram* || true
+    echo
+    echo "ATTENTION : du swap zram est encore actif. Idéalement il aurait dû être"
+    echo "désactivé sur le système installé avec :"
+    echo "    sudo systemctl disable --now pop-default-settings-zram.service"
+    confirm "Désactiver maintenant tous les périphériques zram et continuer ?"
+    for z in /dev/zram*; do
+        [[ -b $z ]] || continue
+        swapoff "$z" 2>/dev/null || true
+    done
+    # Le service systemd-zram* peut recréer les zram ; tenter de l'arrêter
+    systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
+    swapoff -a 2>/dev/null || true
+    if swapon --show 2>/dev/null | grep -q zram; then
+        error "Le swap zram est toujours actif. Impossible de continuer en toute sécurité."
+    fi
+    info "Swap zram désactivé."
+else
+    info "Aucun swap zram actif détecté — correct (service désactivé ou Recovery vierge)."
+fi
+
+# ======================================================================
+# Étapes 2-3 : désactivation et suppression de la partition SWAP
+# ======================================================================
+info "Étape 2-3 : désactivation et suppression de la partition SWAP."
+swapoff -a 2>/dev/null || true
+
+SWAP_PART="$(blkid | awk -F: '$0 ~ /TYPE="swap"/ {print $1; exit}')"
+if [[ -n $SWAP_PART ]]; then
+    echo "Partition SWAP détectée : $SWAP_PART"
+    confirm "Supprimer définitivement $SWAP_PART ? (DONNÉES PERDUES)"
+    PART_NUM="$(echo "$SWAP_PART" | grep -o '[0-9]*$')"
+    parted -s "$DISK" rm "$PART_NUM" || error "Échec de la suppression de la partition swap."
+    partprobe "$DISK" || true
+    info "Partition swap supprimée."
+else
+    echo "Aucune partition swap détectée (fréquent sur 24.04 : seul le zram était utilisé)."
+    confirm "Continuer sans suppression ?"
+fi
+
+# ======================================================================
+# Étape 4 : étendre la partition LUKS jusqu'à la fin du disque
+# ======================================================================
+info "Étape 4 : extension de la partition LUKS $LUKS_PART jusqu'à la fin du disque."
+confirm "Redimensionner $LUKS_PART à 100% de l'espace libre ?"
+parted -s ---pretend-input-tty "$DISK" resizepart \
+    "$(echo "$LUKS_PART" | grep -o '[0-9]*$')" "100%" \
+    || error "Échec du redimensionnement (faites-le avec GParted puis relancez à l'étape 5)."
+partprobe "$DISK" || true
+
+cryptsetup luksOpen "$LUKS_PART" cryptdata || error "Impossible d'ouvrir la partition LUKS."
+vgchange -ay || true
+lvscan
+
+# ======================================================================
+# Étape 5 : réduire le volume root de (mémoire + 4 Go)
+# ======================================================================
+info "Étape 5 : réduction du volume data-root."
+RAM_GB=$(( ($(awk '/MemTotal/ {print $2}' /proc/meminfo) + 1048575) / 1048576 ))
+SWAP_GB=$(( RAM_GB + 4 ))
+echo "Mémoire détectée : ${RAM_GB} Go -> swap de ${SWAP_GB} Go (RAM + 4 Go)."
+free -h
+confirm "Réduire data-root de ${SWAP_GB} Go (fsck + resize2fs inclus) ?"
+lvreduce -r -L "-${SWAP_GB}G" /dev/mapper/data-root \
+  || error "Échec de lvreduce sur data-root."
+
+# ======================================================================
+# Étape 6 : création du volume swap (contigu, taille RAM + 4 Go)
+# ======================================================================
+info "Étape 6 : création du volume swap (${SWAP_GB} Go, allocation contiguë)."
+lvcreate -L "${SWAP_GB}G" --alloc contiguous --name swap data \
+  || error "Échec de lvcreate."
+mkswap /dev/data/swap || error "mkswap a échoué."
+
+# ======================================================================
+# Étape 7 : montage du root, mise à jour de crypttab et fstab
+# ======================================================================
+info "Étape 7 : mise à jour de crypttab et fstab dans /mnt."
+umount /mnt 2>/dev/null || true
+mount /dev/mapper/data-root /mnt || error "Impossible de monter data-root sur /mnt."
+
+# Sauvegardes des fichiers originaux
+cp /mnt/etc/crypttab /mnt/etc/crypttab.bak.hib
+cp /mnt/etc/fstab    /mnt/etc/fstab.bak.hib
+
+# crypttab : retirer l'éventuelle entrée de l'ancienne partition swap
+sed -i -E '/\sswap\s/d' /mnt/etc/crypttab
+info "Ancienne entrée swap retirée de crypttab (backup : crypttab.bak.hib)."
+
+# fstab : remplacer la ligne swap par le nouveau volume
+sed -i -E 's|^.*\sswap\s.*$|/dev/mapper/data-swap none swap defaults 0 0|' /mnt/etc/fstab
+grep -q '/dev/mapper/data-swap' /mnt/etc/fstab \
+  || echo '/dev/mapper/data-swap none swap defaults 0 0' >> /mnt/etc/fstab
+
+# ---- Spécifique 24.04 : neutraliser définitivement le zram dans l'OS cible ----
+info "Neutralisation du zram sur le système installé (hibernation incompatible)."
+# Masquer la configuration zram-generator si présente
+for f in /mnt/etc/systemd/zram-generator.conf /mnt/usr/lib/systemd/zram-generator.conf; do
+    if [[ -f $f ]]; then
+        mv "$f" "$f.disabled.hib" 2>/dev/null || true
+        info "Config zram masquée : $f -> $f.disabled.hib"
+    fi
+done
+# Désactiver le service pop-default-settings-zram dans l'OS cible
+if [[ -d /mnt/etc/systemd/system ]]; then
+    ln -sf /dev/null /mnt/etc/systemd/system/pop-default-settings-zram.service 2>/dev/null \
+        || sed -i '/zram/Is/^/#hibernation-desactive: /' /mnt/etc/fstab
+    info "Service pop-default-settings-zram.service masqué au prochain démarrage."
+fi
+
+info "fstab mis à jour (backup : fstab.bak.hib) :"
+grep -E 'swap|zram' /mnt/etc/fstab || true
+
+umount /mnt
+cryptsetup luksClose cryptdata 2>/dev/null || true
+info "Terminé ! Étapes 2 à 7 terminées."
+info "Redémarrez, vérifiez avec 'free -h', puis poursuivez avec l'étape 9 :"
+info "  sudo blkid   (récupérez l'UUID de /dev/data/swap)"
+info "  sudo kernelstub -a \"resume=UUID=xxxxxxxx-xxxx-xxxx-xxxxxxxx\""
+info "Test final : sudo systemctl hibernate"
