@@ -157,8 +157,10 @@ cp /mnt/etc/crypttab /mnt/etc/crypttab.bak.hib
 cp /mnt/etc/fstab    /mnt/etc/fstab.bak.hib
 
 # crypttab : retirer l'éventuelle entrée de l'ancienne partition swap
-sed -i -E '/\sswap\s/d' /mnt/etc/crypttab
-info "Ancienne entrée swap retirée de crypttab (backup : crypttab.bak.hib)."
+# qu'elle s'appelle cryptswap ou autre
+sed -i -E '/^[[:space:]]*#?[[:alnum:]-]*swap[[:alnum:]-]*[[:space:]]/d' /mnt/etc/crypttab
+
+grep -qi swap /mnt/etc/crypttab && error "Une entrée swap subsiste dans crypttab — vérifiez manuellement."
 
 # fstab : remplacer la ligne swap par le nouveau volume
 sed -i -E 's|^.*\sswap\s.*$|/dev/mapper/data-swap none swap defaults 0 0|' /mnt/etc/fstab
